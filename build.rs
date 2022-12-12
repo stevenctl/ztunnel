@@ -17,15 +17,18 @@ use std::process::Command;
 // This build script is used to generate the rust source files that
 // we need for XDS GRPC communication.
 fn main() -> Result<(), anyhow::Error> {
+    // protos that we want explicit codegen for
     let proto_files = vec![
         "proto/xds.proto",
         "proto/workload.proto",
-        "proto/citadel.proto",
+        "istio-api/security/v1alpha1/ca.proto",
     ]
     .iter()
     .map(|name| std::env::current_dir().unwrap().join(name))
     .collect::<Vec<_>>();
-    let include_dirs = vec!["proto/"]
+
+    // protos that we might depend upon
+    let include_dirs = vec!["proto/", "istio-api/"]
         .iter()
         .map(|i| std::env::current_dir().unwrap().join(i))
         .collect::<Vec<_>>();

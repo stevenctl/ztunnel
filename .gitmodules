@@ -1,0 +1,3 @@
+[submodule "api"]
+	path = istio-api
+	url = https://github.com/istio/api
