@@ -171,7 +171,7 @@ mod tests {
         // track a new connection
         let conn1 = Connection {
             src_identity: None,
-            src_ip: std::net::IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1)),
+            src: std::net::SocketAddr::new(std::net::IpAddr::from([192, 168, 0, 1]), 9999),
             dst_network: "".to_string(),
             dst: std::net::SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 0, 2), 8080)),
         };
@@ -212,7 +212,7 @@ mod tests {
         // track a second connection
         let conn2 = Connection {
             src_identity: None,
-            src_ip: std::net::IpAddr::V4(Ipv4Addr::new(192, 168, 0, 3)),
+            src: std::net::SocketAddr::new(std::net::IpAddr::from([192, 168, 0, 3]), 9999),
             dst_network: "".to_string(),
             dst: std::net::SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 0, 2), 8080)),
         };
@@ -260,7 +260,7 @@ mod tests {
         // create a new connection
         let conn1 = Connection {
             src_identity: None,
-            src_ip: std::net::IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1)),
+            src: std::net::SocketAddr::new(std::net::IpAddr::from([192, 168, 0, 1]), 9999),
             dst_network: "".to_string(),
             dst: std::net::SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 0, 2), 8080)),
         };
@@ -268,7 +268,7 @@ mod tests {
         // create a second connection
         let conn2 = Connection {
             src_identity: None,
-            src_ip: std::net::IpAddr::V4(Ipv4Addr::new(192, 168, 0, 3)),
+            src: std::net::SocketAddr::new(std::net::IpAddr::from([192, 168, 0, 3]), 9999),
             dst_network: "".to_string(),
             dst: std::net::SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 0, 2), 8080)),
         };
@@ -376,7 +376,7 @@ mod tests {
         // create a test connection
         let conn1 = Connection {
             src_identity: None,
-            src_ip: std::net::IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1)),
+            src: std::net::SocketAddr::new(std::net::IpAddr::from([192, 168, 0, 1]), 9999),
             dst_network: "".to_string(),
             dst: std::net::SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 0, 2), 8080)),
         };

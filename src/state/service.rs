@@ -27,6 +27,9 @@ use crate::state::workload::{
 use crate::xds;
 use crate::xds::istio::workload::PortList;
 
+use super::workload::gatewayaddress::Destination;
+use super::workload::GatewayAddress;
+
 #[derive(Debug, Eq, PartialEq, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Service {
@@ -39,6 +42,11 @@ pub struct Service {
     /// Maps endpoint UIDs to service [Endpoint]s.
     #[serde(default)]
     pub endpoints: HashMap<String, Endpoint>,
+    /// Cache the set of gateways in front of this Service
+    /// based on its endoints. We lookup with just the IP,
+    /// but also need to know the different ports.
+    #[serde(default)]
+    pub waypoints: HashMap<Destination, (usize, GatewayAddress)>,
     #[serde(default)]
     pub subject_alt_names: Vec<String>,
 }
@@ -48,6 +56,32 @@ impl Service {
         NamespacedHostname {
             namespace: self.namespace.clone(),
             hostname: self.hostname.clone(),
+        }
+    }
+
+    pub fn insert_waypoint(&mut self, workload: &Workload) {
+        let Some(ref wp) = workload.waypoint else {
+            return;
+        };
+
+        if let Some((count, _)) = self.waypoints.get_mut(&wp.destination) {
+            *count += 1;
+        } else {
+            self.waypoints
+                .insert(wp.destination.clone(), (1, wp.clone()));
+        }
+    }
+
+    pub fn remove_waypoint(&mut self, workload: &Workload) {
+        let Some(ref wp) = workload.waypoint else {
+            return;
+        };
+        if let Some((count, _)) = self.waypoints.get_mut(&wp.destination) {
+            if *count > 1 {
+                *count -= 1;
+            } else {
+                self.waypoints.remove(&wp.destination);
+            }
         }
     }
 }
@@ -116,6 +150,7 @@ impl TryFrom<&XdsService> for Service {
             })
                 .into(),
             endpoints: Default::default(), // Will be populated once inserted into the store.
+            waypoints: Default::default(), // Will be populated once inserted into the store.
             subject_alt_names: s.subject_alt_names.clone(),
         };
         Ok(svc)
@@ -127,10 +162,11 @@ impl TryFrom<&XdsService> for Service {
 pub struct ServiceStore {
     /// Maintains a mapping of service key -> (endpoint UID -> workload endpoint)
     /// this is used to handle ordering issues if workloads are received before services.
-    staged_services: HashMap<NamespacedHostname, HashMap<String, Endpoint>>,
+    staged_services: HashMap<NamespacedHostname, HashMap<String, (Workload, Endpoint)>>,
 
-    /// Maintains a mapping of workload UID to service. This is used only to handle removal of
-    /// service endpoints when a workload is removed.
+    /// Maintains a mapping of workload UID to service. This is used to handle removal of
+    /// service endpoints when a workload is removed. Also used for looking up services
+    /// served by a given workload.
     workload_to_services: HashMap<String, HashSet<NamespacedHostname>>,
 
     /// Allows for lookup of services by network address, the service's xds secondary key.
@@ -199,11 +235,12 @@ impl ServiceStore {
     }
 
     /// Adds an endpoint for the service VIP.
-    pub fn insert_endpoint(&mut self, ep: Endpoint) {
+    pub fn insert_endpoint(&mut self, wl: &Workload, ep: Endpoint) {
         let ep_uid = endpoint_uid(&ep.workload_uid, ep.address.as_ref());
         if let Some(mut svc) = self.get_by_namespaced_host(&ep.service) {
             // Clone the service and add the endpoint.
             svc.endpoints.insert(ep_uid, ep);
+            svc.insert_waypoint(wl);
 
             // Update the service.
             self.insert(svc);
@@ -216,7 +253,7 @@ impl ServiceStore {
             self.staged_services
                 .entry(ep.service.clone())
                 .or_default()
-                .insert(ep_uid, ep.clone());
+                .insert(ep_uid, (wl.clone(), ep.clone()));
 
             // Insert a reverse-mapping from the workload address to the service.
             self.workload_to_services
@@ -227,9 +264,9 @@ impl ServiceStore {
     }
 
     /// Removes entries for the given endpoint address.
-    pub fn remove_endpoint(&mut self, workload_uid: &str, endpoint_uid: &str) {
+    pub fn remove_endpoint(&mut self, workload: &Workload, endpoint_uid: &str) {
         let mut services_to_update = HashSet::new();
-        if let Some(prev_services) = self.workload_to_services.remove(workload_uid) {
+        if let Some(prev_services) = self.workload_to_services.remove(&workload.uid) {
             for svc in prev_services.iter() {
                 // Remove the endpoint from the staged services.
                 self.staged_services
@@ -248,7 +285,7 @@ impl ServiceStore {
         for svc in &services_to_update {
             if let Some(mut svc) = self.get_by_namespaced_host(svc) {
                 svc.endpoints.remove(endpoint_uid);
-
+                svc.remove_waypoint(workload);
                 // Update the service.
                 self.insert(svc);
             }
@@ -261,8 +298,9 @@ impl ServiceStore {
         // the workloads before their associated services.
         let namespaced_hostname = service.namespaced_hostname();
         if let Some(endpoints) = self.staged_services.remove(&namespaced_hostname) {
-            for (wip, ep) in endpoints {
+            for (wip, (wl, ep)) in endpoints {
                 service.endpoints.insert(wip.clone(), ep);
+                service.insert_waypoint(&wl);
             }
         }
 

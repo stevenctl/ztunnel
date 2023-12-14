@@ -1671,6 +1671,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ppp"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82d901d7dd743c478e14af9518bdbc33e53e50be56429233f812537f29dbf0d1"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "pprof"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2973,6 +2982,7 @@ dependencies = [
  "netns-rs",
  "nix 0.26.2",
  "once_cell",
+ "ppp",
  "pprof",
  "priority-queue",
  "prometheus-client",

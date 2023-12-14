@@ -25,6 +25,7 @@ use http_body_util::Empty;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
+
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tracing::{debug, error, info, instrument, trace, trace_span, warn, Instrument};
@@ -33,16 +34,18 @@ use super::connection_manager::{self, ConnectionManager};
 use super::{Error, SocketFactory};
 use crate::baggage::parse_baggage_header;
 use crate::config::Config;
-use crate::identity::SecretManager;
+use crate::identity::{Identity, SecretManager};
 use crate::metrics::Recorder;
 use crate::proxy;
-use crate::proxy::inbound::InboundConnect::{DirectPath, Hbone};
+use crate::proxy::inbound::InboundConnect::{DirectPath, Hbone, ProxyProtocol};
 use crate::proxy::metrics::{ConnectionOpen, Metrics, Reporter};
 use crate::proxy::{metrics, ProxyInputs, TraceParent, BAGGAGE_HEADER, TRACEPARENT_HEADER};
 use crate::rbac::Connection;
 use crate::socket::to_canonical;
 
-use crate::state::workload::{address, GatewayAddress, NetworkAddress, Workload};
+use crate::state::workload::{
+    address, network_addr, GatewayAddress, GatewayProtocol, NativeTunnel, NetworkAddress, Workload
+};
 use crate::state::DemandProxyState;
 use crate::tls::TlsError;
 
@@ -125,7 +128,7 @@ impl Inbound {
                         .ssl()
                         .peer_certificate()
                         .and_then(|x| crate::tls::boring::extract_sans(&x).first().cloned()),
-                    src_ip: to_canonical(socket.get_ref().peer_addr().unwrap()).ip(),
+                    src: to_canonical(socket.get_ref().peer_addr().unwrap()),
                     dst_network: network, // inbound request must be on our network
                     dst,
                 };
@@ -240,7 +243,33 @@ impl Inbound {
                                         error!(dur=?start.elapsed(), "internal server copy: {}", e)
                                     }
                                 }
-                            }
+                            },
+                            ProxyProtocol(req, addresses, src_id) => match hyper::upgrade::on(req).await
+                            {
+                                Ok(mut upgraded) => {
+                                    if let Err(e) =
+                                        super::write_proxy_protocol(&mut stream, addresses, src_id)
+                                            .instrument(trace_span!("proxy protocol"))
+                                            .await
+                                    {
+                                        error!(dur=?start.elapsed(), "write proxy protocol: {}", e);
+                                    } else if let Err(e) = super::copy_hbone(
+                                        &mut upgraded,
+                                        &mut stream,
+                                        &metrics,
+                                        transferred_bytes,
+                                    )
+                                    .instrument(trace_span!("hbone server"))
+                                    .await
+                                    {
+                                        error!(dur=?start.elapsed(), "hbone server copy: {}", e);
+                                    }
+                                }
+                                Err(e) => {
+                                    // Not sure if this can even happen
+                                    error!(dur=?start.elapsed(), "No upgrade {e}");
+                                }
+                            },
                             Hbone(req) => match hyper::upgrade::on(req).await {
                                 Ok(mut upgraded) => {
                                     let res = tokio::select! {
@@ -289,7 +318,7 @@ impl Inbound {
     #[allow(clippy::too_many_arguments)]
     #[instrument(name="inbound", skip_all, fields(
         id=%Self::extract_traceparent(&req),
-        peer_ip=%conn.src_ip,
+        peer_ip=%conn.src.ip(),
         peer_id=%OptionDisplay(&conn.src_identity)
     ))]
     async fn serve_connect(
@@ -301,144 +330,190 @@ impl Inbound {
         socket_factory: Arc<dyn SocketFactory + Send + Sync>,
         connection_manager: ConnectionManager,
     ) -> Result<Response<Empty<Bytes>>, hyper::Error> {
-        match req.method() {
-            &Method::CONNECT => {
-                let uri = req.uri();
-                info!("got {} request to {}", req.method(), uri);
-                let addr: Result<SocketAddr, _> = uri.to_string().as_str().parse();
-                if addr.is_err() {
-                    info!("Sending 400, {:?}", addr.err());
-                    return Ok(Response::builder()
-                        .status(StatusCode::BAD_REQUEST)
-                        .body(Empty::new())
-                        .unwrap());
-                }
-
-                let addr: SocketAddr = addr.unwrap();
-                if addr.ip() != conn.dst.ip() {
-                    info!("Sending 400, ip mismatch {addr} != {}", conn.dst);
-                    return Ok(Response::builder()
-                        .status(StatusCode::BAD_REQUEST)
-                        .body(Empty::new())
-                        .unwrap());
-                }
-                // Orig has 15008, swap with the real port
-                let conn = Connection { dst: addr, ..conn };
-                let dst_network_addr = NetworkAddress {
-                    network: conn.dst_network.to_string(), // dst must be on our network
-                    address: addr.ip(),
-                };
-                let Some((upstream, upstream_service)) =
-                    state.fetch_workload_services(&dst_network_addr).await
-                else {
-                    info!(%conn, "unknown destination");
-                    return Ok(Response::builder()
-                        .status(StatusCode::NOT_FOUND)
-                        .body(Empty::new())
-                        .unwrap());
-                };
-                let has_waypoint = upstream.waypoint.is_some();
-                let from_waypoint = Self::check_waypoint(state.clone(), &upstream, &conn).await;
-                let from_gateway = Self::check_gateway(state.clone(), &upstream, &conn).await;
-
-                if from_gateway {
-                    debug!("request from gateway");
-                }
-                //register before assert_rbac to ensure the connection is tracked during it's entire valid span
-                connection_manager.register(&conn).await;
-                if from_waypoint {
-                    debug!("request from waypoint, skipping policy");
-                } else if !state.assert_rbac(&conn).await {
-                    info!(%conn, "RBAC rejected");
-                    connection_manager.release(&conn).await;
-                    return Ok(Response::builder()
-                        .status(StatusCode::UNAUTHORIZED)
-                        .body(Empty::new())
-                        .unwrap());
-                }
-                if has_waypoint && !from_waypoint {
-                    info!(%conn, "bypassed waypoint");
-                    connection_manager.release(&conn).await;
-                    return Ok(Response::builder()
-                        .status(StatusCode::UNAUTHORIZED)
-                        .body(Empty::new())
-                        .unwrap());
-                }
-                let source_ip = if from_waypoint {
-                    // If the request is from our waypoint, trust the Forwarded header.
-                    // For other request types, we can only trust the source from the connection.
-                    // Since our own waypoint is in the same trust domain though, we can use Forwarded,
-                    // which drops the requirement of spoofing IPs from waypoints
-                    super::get_original_src_from_fwded(&req).unwrap_or(conn.src_ip)
-                } else {
-                    conn.src_ip
-                };
-
-                let baggage =
-                    parse_baggage_header(req.headers().get_all(BAGGAGE_HEADER)).unwrap_or_default();
-
-                let source = match from_gateway {
-                    true => None, // we cannot lookup source workload since we don't know the network, see https://github.com/istio/ztunnel/issues/515
-                    false => {
-                        let src_network_addr = NetworkAddress {
-                            // we can assume source network is our network because we did not traverse a gateway
-                            network: conn.dst_network.to_string(),
-                            address: source_ip,
-                        };
-                        // Find source info. We can lookup by XDS or from connection attributes
-                        state.fetch_workload(&src_network_addr).await
-                    }
-                };
-
-                let derived_source = metrics::DerivedWorkload {
-                    identity: conn.src_identity.clone(),
-                    cluster_id: baggage.cluster_id,
-                    namespace: baggage.namespace,
-                    workload_name: baggage.workload_name,
-                    revision: baggage.revision,
-                    ..Default::default()
-                };
-                let ds = proxy::guess_inbound_service(&conn, upstream_service, &upstream);
-                let connection_metrics = ConnectionOpen {
-                    reporter: Reporter::destination,
-                    source,
-                    derived_source: Some(derived_source),
-                    destination: Some(upstream),
-                    connection_security_policy: metrics::SecurityPolicy::mutual_tls,
-                    destination_service: ds,
-                };
-                let status_code = match Self::handle_inbound(
-                    Hbone(req),
-                    enable_original_source.then_some(source_ip),
-                    addr,
-                    metrics,
-                    connection_metrics,
-                    None,
-                    socket_factory.as_ref(),
-                    connection_manager,
-                    conn,
-                )
-                .in_current_span()
-                .await
-                {
-                    Ok(_) => StatusCode::OK,
-                    Err(_) => StatusCode::SERVICE_UNAVAILABLE,
-                };
-
-                Ok(Response::builder()
-                    .status(status_code)
-                    .body(Empty::new())
-                    .unwrap())
-            }
-            // Return the 404 Not Found for other routes.
-            method => {
-                info!("Sending 404, got {method}");
-                Ok(Response::builder()
-                    .status(StatusCode::NOT_FOUND)
-                    .body(Empty::new())
-                    .unwrap())
-            }
+        let method = req.method();
+        if req.method() != Method::CONNECT {
+            info!("Sending 404, got {method}");
+            return Ok(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Empty::new())
+                .unwrap());
         }
+        let uri = req.uri();
+        info!("got {} request to {}", req.method(), uri);
+
+        let hbone_addr: SocketAddr = match uri.to_string().as_str().parse() {
+            Ok(addr) => addr,
+            Err(err) => {
+                info!("Sending 400, {:?}", err);
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(Empty::new())
+                    .unwrap());
+            }
+        };
+
+        // the conn IP may be the Waypoint, and the CONNECT authority is the client's intended
+        // destination for the waypoint to handle
+        let to_sandwiched_waypoint = Self::check_sandwich(&state, &conn, &hbone_addr).await;
+
+        if !to_sandwiched_waypoint && hbone_addr.ip() != conn.dst.ip() {
+            info!("Sending 400, ip mismatch {hbone_addr} != {}", conn.dst);
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Empty::new())
+                .unwrap());
+        }
+
+        // Orig has 15008, swap with the real port
+        let dst = match to_sandwiched_waypoint {
+            false => hbone_addr,
+            true => SocketAddr::new(conn.dst.ip(), hbone_addr.port()),
+        };
+        let conn = Connection { dst, ..conn };
+
+        let dst_network_addr = &NetworkAddress {
+            network: conn.dst_network.to_string(), // dst must be on our network
+            address: conn.dst.ip(),
+        };
+        let Some((upstream, upstream_services)) =
+            state.fetch_workload_services(dst_network_addr).await
+        else {
+            info!(%conn, "unknown destination");
+            return Ok(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Empty::new())
+                .unwrap());
+        };
+
+        let has_waypoint = upstream.waypoint.is_some();
+        let from_waypoint = Self::check_waypoint(state.clone(), &upstream, &conn).await;
+        let from_gateway = Self::check_gateway(state.clone(), &upstream, &conn).await;
+
+        //register before assert_rbac to ensure the connection is tracked during it's entire valid span
+        connection_manager.register(&conn).await;
+
+        if from_gateway {
+            debug!("request from gateway");
+        }
+        if from_waypoint {
+            debug!("request from waypoint, skipping policy");
+        } else if to_sandwiched_waypoint {
+            debug!("request to sandwiched waypoint, skipping policy");
+        } else if !state.assert_rbac(&conn).await {
+            info!(%conn, "RBAC rejected");
+            connection_manager.release(&conn).await;
+            return Ok(Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .body(Empty::new())
+                .unwrap());
+        }
+        if has_waypoint && !from_waypoint {
+            info!(%conn, "bypassed waypoint");
+            connection_manager.release(&conn).await;
+            return Ok(Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .body(Empty::new())
+                .unwrap());
+        }
+        let source_ip = if from_waypoint {
+            // If the request is from our waypoint, trust the Forwarded header.
+            // For other request types, we can only trust the source from the connection.
+            // Since our own waypoint is in the same trust domain though, we can use Forwarded,
+            // which drops the requirement of spoofing IPs from waypoints
+            super::get_original_src_from_fwded(&req).unwrap_or(conn.src.ip())
+        } else {
+            conn.src.ip()
+        };
+
+        let baggage =
+            parse_baggage_header(req.headers().get_all(BAGGAGE_HEADER)).unwrap_or_default();
+
+        let source = match from_gateway {
+            true => None, // we cannot lookup source workload since we don't know the network, see https://github.com/istio/ztunnel/issues/515
+            false => {
+                let src_network_addr = NetworkAddress {
+                    // we can assume source network is our network because we did not traverse a gateway
+                    network: conn.dst_network.to_string(),
+                    address: source_ip,
+                };
+                // Find source info. We can lookup by XDS or from connection attributes
+                state.fetch_workload(&src_network_addr).await
+            }
+        };
+
+        let derived_source = metrics::DerivedWorkload {
+            identity: conn.src_identity.clone(),
+            cluster_id: baggage.cluster_id,
+            namespace: baggage.namespace,
+            workload_name: baggage.workload_name,
+            revision: baggage.revision,
+            ..Default::default()
+        };
+
+        let dst_svc = proxy::guess_inbound_service(&conn, upstream_services, &upstream);
+
+        let connection_metrics = ConnectionOpen {
+            reporter: Reporter::destination,
+            source,
+            derived_source: Some(derived_source),
+            // TODO avoid cloning here
+            destination: Some(upstream.clone()),
+            connection_security_policy: metrics::SecurityPolicy::mutual_tls,
+            destination_service: dst_svc,
+        };
+
+        let (req, port_override) = match upstream.native_tunnel {
+            Some(NativeTunnel {
+                protocol: GatewayProtocol::PROXY,
+                port: proxy_port,
+            }) => (
+                ProxyProtocol(req, (conn.src, hbone_addr), conn.src_identity.clone()),
+                proxy_port,
+            ),
+            _ => (Hbone(req), None),
+        };
+
+        let status_code = match Self::handle_inbound(
+            req,
+            enable_original_source.then_some(source_ip),
+            port_override.map_or(conn.dst, |p| SocketAddr::new(conn.dst.ip(), p)),
+            metrics,
+            connection_metrics,
+            None,
+            socket_factory.as_ref(),
+            connection_manager,
+            conn,
+        )
+        .in_current_span()
+        .await
+        {
+            Ok(_) => StatusCode::OK,
+            Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+        };
+
+        Ok(Response::builder()
+            .status(status_code)
+            .body(Empty::new())
+            .unwrap())
+    }
+
+    // if the conn and hbone_addr have a waypoint relationship, the sandwich port is returned
+    async fn check_sandwich(
+        state: &DemandProxyState,
+        conn: &Connection,
+        hbone_addr: &SocketAddr,
+    ) -> bool {
+        // if these match, this is regular inbound
+        if conn.dst.ip() == hbone_addr.ip() {
+            return false;
+        }
+
+        let waypoint_addr = &network_addr(&conn.dst_network, conn.dst.ip());
+        let target_addr = &network_addr(&conn.dst_network, hbone_addr.ip());
+        state
+            .find_waypoint_for_address(target_addr, waypoint_addr)
+            .await
+            .is_some()
     }
 
     async fn check_waypoint(
@@ -505,6 +580,13 @@ pub(super) enum InboundConnect {
     DirectPath(TcpStream),
     /// Hbone is a standard HBONE request coming from the network.
     Hbone(Request<Incoming>),
+    // Sandwich sends the source and destination addresses and the source identity over proxy
+    // protocol before forwarding bytes similar to HBONE.
+    ProxyProtocol(
+        Request<Incoming>,
+        (SocketAddr, SocketAddr),
+        Option<Identity>,
+    ),
 }
 
 #[derive(Clone)]
@@ -584,13 +666,13 @@ mod test {
         };
         let from_gw_conn = Connection {
             src_identity: Some(gateawy_id),
-            src_ip: IpAddr::V4(mock_default_gateway_ipaddr()),
+            src: SocketAddr::V4(SocketAddrV4::new(mock_default_gateway_ipaddr(), 9999)),
             dst_network: "default".to_string(),
             dst: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 10), 80)),
         };
         let not_from_gw_conn = Connection {
             src_identity: Some(Identity::default()),
-            src_ip: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            src: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 9999)),
             dst_network: "default".to_string(),
             dst: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 10), 80)),
         };
@@ -634,7 +716,7 @@ mod test {
             cluster_id: "Kubernetes".to_string(),
 
             authorization_policies: Vec::new(),
-            native_tunnel: false,
+            native_tunnel: None,
         }
     }
 
@@ -661,7 +743,7 @@ mod test {
             cluster_id: "Kubernetes".to_string(),
 
             authorization_policies: Vec::new(),
-            native_tunnel: false,
+            native_tunnel: None,
         }
     }
 
@@ -696,6 +778,7 @@ mod test {
             hostname: "gateway".to_string(),
             vips,
             ports,
+            waypoints: Default::default(),
             endpoints,
             subject_alt_names: vec![],
         }

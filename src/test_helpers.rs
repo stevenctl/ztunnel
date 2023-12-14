@@ -177,14 +177,14 @@ pub fn mock_default_service() -> Service {
     let vips = vec![vip1];
     let mut ports = HashMap::new();
     ports.insert(8080, 80);
-    let endpoints = HashMap::new();
     Service {
         name: "".to_string(),
         namespace: "default".to_string(),
         hostname: "defaulthost".to_string(),
         vips,
         ports,
-        endpoints,
+        endpoints: Default::default(),
+        waypoints: Default::default(),
         subject_alt_names: vec![],
     }
 }
@@ -212,7 +212,7 @@ pub fn test_default_workload() -> Workload {
         cluster_id: "Kubernetes".to_string(),
 
         authorization_policies: Vec::new(),
-        native_tunnel: false,
+        native_tunnel: None,
     }
 }
 
@@ -287,6 +287,7 @@ fn test_custom_svc(
                 port: HashMap::from([(80u16, echo_port)]),
             },
         )]),
+        waypoints: Default::default(),
         subject_alt_names: vec!["spiffe://cluster.local/ns/default/sa/default".to_string()],
     })
 }

@@ -56,6 +56,51 @@ impl TryFrom<Option<xds::istio::workload::TunnelProtocol>> for Protocol {
     }
 }
 
+
+#[derive(
+    Default, Debug, Hash, Eq, PartialEq, Clone, Copy, serde::Serialize, serde::Deserialize,
+)]
+pub enum GatewayProtocol {
+    #[default]
+    TCP,
+    HBONE,
+    PROXY,
+}
+
+impl TryFrom<Option<xds::istio::workload::GatewayProtocol>> for GatewayProtocol {
+    type Error = WorkloadError;
+
+    fn try_from(value: Option<xds::istio::workload::GatewayProtocol>) -> Result<Self, Self::Error> {
+        match value {
+            Some(xds::istio::workload::GatewayProtocol::SimpleTcp) => Ok(GatewayProtocol::TCP),
+            Some(xds::istio::workload::GatewayProtocol::NativeHbone) => Ok(GatewayProtocol::HBONE),
+            Some(xds::istio::workload::GatewayProtocol::Proxy) => Ok(GatewayProtocol::PROXY),
+            None => Err(EnumParse("unknown type".into())),
+        }
+    }
+}
+
+#[derive(
+    Default, Debug, Hash, Eq, PartialEq, Clone, Copy, serde::Serialize, serde::Deserialize,
+)]
+pub struct NativeTunnel {
+    pub protocol: GatewayProtocol,
+    pub port: Option<u16>
+}
+
+impl TryFrom<xds::istio::workload::NativeTunnel> for NativeTunnel {
+    type Error = WorkloadError;
+
+    fn try_from(resource: xds::istio::workload::NativeTunnel) -> Result<Self, Self::Error> {
+        Ok(NativeTunnel{
+            protocol: GatewayProtocol::try_from(xds::istio::workload::GatewayProtocol::from_i32(
+                resource.protocol,
+            ))?,
+            port: if resource.port == 0 { None } else { Some(resource.port as u16)},
+        })
+    }
+}
+
 #[derive(
     Default, Debug, Hash, Eq, PartialEq, Clone, Copy, serde::Serialize, serde::Deserialize,
 )]
@@ -150,7 +195,7 @@ pub struct Workload {
     pub node: String,
 
     #[serde(default, skip_serializing_if = "is_default")]
-    pub native_tunnel: bool,
+    pub native_tunnel: Option<NativeTunnel>,
 
     #[serde(default, skip_serializing_if = "is_default")]
     pub authorization_policies: Vec<String>,
@@ -303,6 +348,13 @@ impl TryFrom<&XdsWorkload> for Workload {
             .collect::<Result<Vec<_>, _>>()?;
 
         let workload_type = resource.workload_type().as_str_name().to_lowercase();
+
+        let native_tunnel = match (resource.native_tunnel, resource.is_native_tunnel) {
+            (Some(native_tunnel), _) => Some(NativeTunnel::try_from(native_tunnel)?),
+            (_, true) => Some(NativeTunnel{protocol: GatewayProtocol::HBONE, port: None}),
+            (_, false) => None,
+        };
+
         Ok(Workload {
             workload_ips: addresses,
             waypoint: wp,
@@ -344,7 +396,7 @@ impl TryFrom<&XdsWorkload> for Workload {
                 resource.status,
             ))?,
 
-            native_tunnel: resource.native_tunnel,
+            native_tunnel,
             authorization_policies: resource.authorization_policies,
 
             cluster_id: {

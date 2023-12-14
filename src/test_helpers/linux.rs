@@ -206,6 +206,7 @@ impl<'a> TestServiceBuilder<'a> {
                 vips: vec![],
                 ports: Default::default(),
                 endpoints: Default::default(), // populated later when workloads are added
+                waypoints: Default::default(), // populated later when workloads are added
                 subject_alt_names: vec![],
             },
             manager,
@@ -345,6 +346,7 @@ impl<'a> TestWorkloadBuilder<'a> {
                 let mut svc = self.manager.services.get(&service_name).unwrap().clone();
                 let ep_uid = endpoint_uid(&self.w.workload.uid, Some(&ep_network_addr));
                 svc.endpoints.insert(ep_uid, ep.clone());
+                svc.insert_waypoint(&self.w.workload);
             }
         }
 

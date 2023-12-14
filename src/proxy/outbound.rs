@@ -36,7 +36,7 @@ use crate::proxy::{util, Error, ProxyInputs, TraceParent, BAGGAGE_HEADER, TRACEP
 
 use crate::state::service::ServiceDescription;
 use crate::state::set_gateway_address;
-use crate::state::workload::{NetworkAddress, Protocol, Workload};
+use crate::state::workload::{NetworkAddress, Protocol, GatewayProtocol, Workload};
 use crate::{hyper_util, proxy, rbac, socket};
 
 pub struct Outbound {
@@ -131,13 +131,13 @@ impl OutboundConnection {
     async fn proxy(&mut self, stream: TcpStream) -> Result<(), Error> {
         let peer = socket::to_canonical(stream.peer_addr().expect("must receive peer addr"));
         let orig_dst_addr = socket::orig_dst_addr_or_default(&stream);
-        self.proxy_to(stream, peer.ip(), orig_dst_addr, false).await
+        self.proxy_to(stream, peer, orig_dst_addr, false).await
     }
 
     pub async fn proxy_to(
         &mut self,
         mut stream: TcpStream,
-        remote_addr: IpAddr,
+        remote_addr: SocketAddr,
         orig_dst_addr: SocketAddr,
         block_passthrough: bool,
     ) -> Result<(), Error> {
@@ -146,7 +146,7 @@ impl OutboundConnection {
         {
             return Err(Error::SelfCall);
         }
-        let req = self.build_request(remote_addr, orig_dst_addr).await?;
+        let req = self.build_request(remote_addr.ip(), orig_dst_addr).await?;
         debug!(
             "request from {} to {} via {} type {:#?} dir {:#?}",
             req.source.name, orig_dst_addr, req.gateway, req.request_type, req.direction
@@ -161,7 +161,8 @@ impl OutboundConnection {
             && !req
                 .destination_workload
                 .as_ref()
-                .map(|w| w.native_tunnel)
+                .map(|w| w.native_tunnel.map(|nt| nt.protocol == GatewayProtocol::HBONE))
+                .flatten()
                 .unwrap_or(false);
         let connection_metrics = metrics::ConnectionOpen {
             reporter: Reporter::source,
@@ -189,7 +190,7 @@ impl OutboundConnection {
             };
             let conn = rbac::Connection {
                 src_identity: Some(req.source.identity()),
-                src_ip: remote_addr,
+                src: remote_addr,
                 dst_network: req.source.network.clone(), // since this is node local, it's the same network
                 dst: req.destination,
             };
@@ -283,7 +284,7 @@ impl OutboundConnection {
                         .configure()
                         .expect("configure");
                     let tcp_stream = super::freebind_connect(
-                        local,
+                        local.map(|addr| addr.ip()),
                         req.gateway,
                         self.pi.socket_factory.as_ref(),
                     )
@@ -360,7 +361,7 @@ impl OutboundConnection {
                 )
                 .await
                 .map(|_| ())
-            }
+            },
         }
     }
 
@@ -412,46 +413,56 @@ impl OutboundConnection {
             .await?;
 
         // For case upstream server has enabled waypoint
-        match self
+        let from_waypoint = match self
             .pi
             .state
             .fetch_waypoint(&mutable_us.workload, workload_ip)
             .await
         {
-            Ok(None) => {} // workload doesn't have a waypoint; this is fine
+            Ok(None) => false, // workload doesn't have a waypoint; this is fine
             Ok(Some(waypoint_us)) => {
                 let waypoint_workload = waypoint_us.workload;
-                let waypoint_ip = self
-                    .pi
-                    .state
-                    .load_balance(
-                        &waypoint_workload,
-                        &source_workload,
-                        self.pi.metrics.clone(),
-                    )
-                    .await?;
-                let wp_socket_addr = SocketAddr::new(waypoint_ip, waypoint_us.port);
-                return Ok(Request {
-                    // Always use HBONE here
-                    protocol: Protocol::HBONE,
-                    source: source_workload,
-                    // Use the original VIP, not translated
-                    destination: target,
-                    destination_workload: Some(mutable_us.workload),
-                    destination_service: mutable_us.destination_service.clone(),
-                    expected_identity: Some(waypoint_workload.identity()),
-                    gateway: wp_socket_addr,
-                    // Let the client remote know we are on the inbound path.
-                    direction: Direction::Inbound,
-                    request_type: RequestType::ToServerWaypoint,
-                    upstream_sans: mutable_us.sans,
-                });
+
+                if !waypoint_workload.workload_ips.contains(&downstream) {
+                    let waypoint_ip = self
+                        .pi
+                        .state
+                        .load_balance(
+                            &waypoint_workload,
+                            &source_workload,
+                            self.pi.metrics.clone(),
+                        )
+                        .await?;
+
+                    let wp_socket_addr = SocketAddr::new(waypoint_ip, waypoint_us.port);
+                    return Ok(Request {
+                        // Always use HBONE here
+                        protocol: Protocol::HBONE,
+                        source: source_workload,
+                        // Use the original VIP, not translated
+                        destination: target,
+                        destination_workload: Some(mutable_us.workload),
+                        destination_service: mutable_us.destination_service.clone(),
+                        expected_identity: Some(waypoint_workload.identity()),
+                        gateway: wp_socket_addr,
+                        // Let the client remote know we are on the inbound path.
+                        direction: Direction::Inbound,
+                        request_type: RequestType::ToServerWaypoint,
+                        upstream_sans: mutable_us.sans,
+                    });
+                }
+                true
             }
             // we expected the workload to have a waypoint, but could not find one
             Err(e) => return Err(Error::UnknownWaypoint(e.to_string())),
-        }
+        };
 
-        let us = match set_gateway_address(&mut mutable_us, workload_ip, self.pi.hbone_port) {
+        let us = match set_gateway_address(
+            &mut mutable_us,
+            workload_ip,
+            self.pi.hbone_port,
+            from_waypoint,
+        ) {
             Ok(_) => mutable_us,
             Err(e) => {
                 debug!(%mutable_us.workload.workload_name, "failed to set gateway address for upstream: {}", e);

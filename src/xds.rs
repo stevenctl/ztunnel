@@ -140,10 +140,10 @@ impl ProxyStateUpdateMutator {
         self.cert_fetcher.prefetch_cert(&workload);
 
         // Lock and upstate the stores.
-        state.workloads.insert(workload)?;
         while let Some(endpoint) = endpoints.pop() {
-            state.services.insert_endpoint(endpoint);
+            state.services.insert_endpoint(&workload, endpoint);
         }
+        state.workloads.insert(workload)?;
 
         Ok(())
     }
@@ -163,12 +163,12 @@ impl ProxyStateUpdateMutator {
                 let prev_addr = &network_addr(&prev.network, *wip);
                 state
                     .services
-                    .remove_endpoint(&prev.uid, &endpoint_uid(&prev.uid, Some(prev_addr)));
+                    .remove_endpoint(&prev, &endpoint_uid(&prev.uid, Some(prev_addr)));
             }
             if prev.workload_ips.is_empty() {
                 state
                     .services
-                    .remove_endpoint(&prev.uid, &endpoint_uid(&prev.uid, None));
+                    .remove_endpoint(&prev, &endpoint_uid(&prev.uid, None));
             }
 
             // We removed a workload, no reason to attempt to remove a service with the same name
@@ -225,6 +225,9 @@ impl ProxyStateUpdateMutator {
         {
             for (wip, ep) in prev.endpoints.iter() {
                 service.endpoints.insert(wip.clone(), ep.clone());
+                if let Some(ref wl) = state.workloads.find_uid(&ep.workload_uid) {
+                    service.insert_waypoint(wl);
+                }
             }
         }
 
@@ -407,7 +410,7 @@ impl LocalClient {
 
             let mut endpoints = service_endpoints(&wl.workload, &services)?;
             while let Some(ep) = endpoints.pop() {
-                state.services.insert_endpoint(ep)
+                state.services.insert_endpoint(&wl.workload, ep)
             }
         }
         for rbac in r.policies {

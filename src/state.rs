@@ -18,6 +18,7 @@ use crate::proxy::{Error, OnDemandDnsLabels};
 use crate::state::policy::PolicyStore;
 use crate::state::service::ServiceStore;
 use crate::state::service::{Service, ServiceDescription};
+use crate::state::workload::GatewayAddress;
 use crate::state::workload::{
     address::Address, gatewayaddress::Destination, network_addr, NamespacedHostname,
     NetworkAddress, Protocol, WaypointError, Workload, WorkloadStore,
@@ -39,6 +40,7 @@ use std::default::Default;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
+use tokio::join;
 use tracing::{debug, trace, warn};
 
 pub mod policy;
@@ -444,6 +446,73 @@ impl DemandProxyState {
             .cloned()
     }
 
+    // in the case that waypoin_addr is actually a Waypoint for target_addr
+    // finds the GatewayAddress that target_addr uses to reference waypoit_addr
+    pub async fn find_waypoint_for_address(
+        &self,
+        target_addr: &NetworkAddress,
+        waypoint_addr: &NetworkAddress,
+    ) -> Option<GatewayAddress> {
+        let fetch = |target_addr: &NetworkAddress,
+                     waypoint_addr: &NetworkAddress|
+         -> Result<Option<GatewayAddress>, Error> {
+            let state = self.state.read().unwrap();
+
+            // Collect all the possible waypoints for the target.
+            let Some(target) = state.find_address(target_addr) else {
+                return Err(Error::UnknownDestination(target_addr.address));
+            };
+            let Some(mut target_waypoints) = (match target {
+                Address::Workload(wl) => wl.waypoint.map(|addr| {
+                    vec![(addr.destination.clone(), (1, addr))]
+                        .into_iter()
+                        .collect()
+                }),
+                Address::Service(svc) => Some(svc.waypoints),
+            }) else {
+                debug!("No waypoints for target workload: {target_addr}");
+                return Ok(None);
+            };
+            if target_waypoints.is_empty() {
+                debug!("No waypoints for target service: {target_addr}");
+                return Ok(None);
+            }
+
+            // Waypoint instance is referenced directly
+            if let Some((_, gw_addr)) =
+                target_waypoints.remove(&Destination::Address(waypoint_addr.clone()))
+            {
+                return Ok(Some(gw_addr));
+            }
+
+            // Waypoint is referenced by the service it's part of
+            Ok(state
+                .workloads
+                .find_address(waypoint_addr)
+                .map(|wl| {
+                    state
+                        .services
+                        .get_by_workload(&wl)
+                        .iter()
+                        .flat_map(|svc| &svc.vips)
+                        .find_map(|wp_vip| {
+                            target_waypoints.remove(&Destination::Address(wp_vip.clone()))
+                        })
+                        .map(|el| el.1)
+                })
+                .flatten())
+        };
+        if let Ok(result) = fetch(target_addr, waypoint_addr) {
+            return result;
+        }
+        // Wait for it on-demand, *if* needed
+        join!(
+            self.fetch_on_demand(target_addr.to_string()),
+            self.fetch_on_demand(waypoint_addr.to_string()),
+        );
+        fetch(target_addr, waypoint_addr).unwrap_or(None)
+    }
+
     pub async fn fetch_workload_services(
         &self,
         addr: &NetworkAddress,
@@ -516,7 +585,12 @@ impl DemandProxyState {
         {
             Some(mut upstream) => {
                 debug!(%wl.name, "found waypoint upstream");
-                match set_gateway_address(&mut upstream, workload_ip, gw_address.hbone_mtls_port) {
+                match set_gateway_address(
+                    &mut upstream,
+                    workload_ip,
+                    gw_address.hbone_mtls_port,
+                    false,
+                ) {
                     Ok(_) => Ok(Some(upstream)),
                     Err(e) => {
                         debug!(%wl.name, "failed to set gateway address for upstream: {}", e);
@@ -583,14 +657,19 @@ pub fn set_gateway_address(
     us: &mut Upstream,
     workload_ip: IpAddr,
     hbone_port: u16,
+    from_waypoint: bool,
 ) -> anyhow::Result<()> {
     if us.workload.gateway_address.is_none() {
         us.workload.gateway_address = Some(match us.workload.protocol {
             Protocol::HBONE => {
-                let ip = us
-                    .workload
-                    .waypoint_svc_ip_address()?
-                    .unwrap_or(workload_ip);
+                let ip = if from_waypoint {
+                    // don't traverse waypoint twice (sandwich outbound)
+                    workload_ip
+                } else {
+                    us.workload
+                        .waypoint_svc_ip_address()?
+                        .unwrap_or(workload_ip)
+                };
                 SocketAddr::from((ip, hbone_port))
             }
             Protocol::TCP => SocketAddr::from((workload_ip, us.port)),

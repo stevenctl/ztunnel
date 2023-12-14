@@ -908,7 +908,7 @@ mod tests {
                     let conn = crate::rbac::Connection{
                         dst: std::net::SocketAddr::new(std::net::Ipv4Addr::new(1, 2, 3, 4).into(), 80),
                         src_identity: None,
-                        src_ip: std::net::Ipv4Addr::new(1, 2,3, 5).into(),
+                        src: std::net::SocketAddr::new(std::net::Ipv4Addr::new(1, 2,3, 5).into(), 9999),
                         dst_network: "".to_string(),
                     };
                     // rbac should reject port 80

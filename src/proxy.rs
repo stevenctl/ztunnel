@@ -23,6 +23,7 @@ use drain::Watch;
 use hyper::{header, Request};
 use rand::Rng;
 
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::time::timeout;
 use tracing::{error, trace, warn, Instrument};
@@ -30,7 +31,7 @@ use tracing::{error, trace, warn, Instrument};
 use inbound::Inbound;
 pub use metrics::*;
 
-use crate::identity::SecretManager;
+use crate::identity::{Identity, SecretManager};
 use crate::metrics::Recorder;
 use crate::proxy::inbound_passthrough::InboundPassthrough;
 use crate::proxy::outbound::Outbound;
@@ -267,7 +268,6 @@ pub async fn copy_hbone(
     metrics: impl AsRef<Metrics>,
     transferred_bytes: BytesTransferred<'_>,
 ) -> Result<(), Error> {
-    use tokio::io::AsyncWriteExt;
     let (mut ri, mut wi) = tokio::io::split(hyper_util::rt::TokioIo::new(upgraded));
     let (mut ro, mut wo) = stream.split();
 
@@ -296,6 +296,29 @@ pub async fn copy_hbone(
         .as_ref()
         .record(&transferred_bytes, (sent, received));
     Ok(())
+}
+
+const PROXY_PROTOCOL_AUTHORITY_TLV: u8 = 0xD0;
+
+pub async fn write_proxy_protocol<T>(
+    stream: &mut TcpStream,
+    addresses: T,
+    src_id: Option<Identity>,
+) -> io::Result<()>
+where
+    T: Into<ppp::v2::Addresses>,
+{
+    use ppp::v2::{Builder, Command, Protocol, Version};
+
+    let mut builder =
+        Builder::with_addresses(Version::Two | Command::Proxy, Protocol::Stream, addresses);
+
+    if let Some(id) = src_id {
+        builder = builder.write_tlv(PROXY_PROTOCOL_AUTHORITY_TLV, id.to_string().as_bytes())?;
+    }
+
+    let header = builder.build()?;
+    stream.write_all(&header).await
 }
 
 /// Represents a traceparent, as defined by https://www.w3.org/TR/trace-context/
