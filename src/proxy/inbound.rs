@@ -273,150 +273,147 @@ impl Inbound {
         req: Request<Incoming>,
         connection_manager: ConnectionManager,
     ) -> Result<Response<Empty<Bytes>>, hyper::Error> {
-        match req.method() {
-            &Method::CONNECT => {
-                let uri = req.uri();
-                info!("got {} request to {}", req.method(), uri);
-                let addr: Result<SocketAddr, _> = uri.to_string().as_str().parse();
-                if addr.is_err() {
-                    info!("Sending 400, {:?}", addr.err());
-                    return Ok(Response::builder()
-                        .status(StatusCode::BAD_REQUEST)
-                        .body(Empty::new())
-                        .unwrap());
-                }
-
-                let addr: SocketAddr = addr.unwrap();
-                if addr.ip() != conn.dst.ip() {
-                    info!("Sending 400, ip mismatch {addr} != {}", conn.dst);
-                    return Ok(Response::builder()
-                        .status(StatusCode::BAD_REQUEST)
-                        .body(Empty::new())
-                        .unwrap());
-                }
-                // Orig has 15008, swap with the real port
-                let conn = Connection { dst: addr, ..conn };
-                let dst_network_addr = NetworkAddress {
-                    network: conn.dst_network.to_string(), // dst must be on our network
-                    address: addr.ip(),
-                };
-                let Some((upstream, upstream_service)) =
-                    pi.state.fetch_workload_services(&dst_network_addr).await
-                else {
-                    info!(%conn, "unknown destination");
-                    return Ok(Response::builder()
-                        .status(StatusCode::NOT_FOUND)
-                        .body(Empty::new())
-                        .unwrap());
-                };
-                let has_waypoint = upstream.waypoint.is_some();
-                let from_waypoint = Self::check_waypoint(pi.state.clone(), &upstream, &conn).await;
-                let from_gateway = Self::check_gateway(pi.state.clone(), &upstream, &conn).await;
-
-                if from_gateway {
-                    debug!("request from gateway");
-                }
-
-                let rbac_ctx = crate::state::ProxyRbacContext {
-                    conn,
-                    dest_workload_info: pi.proxy_workload_info.clone(),
-                };
-
-                //register before assert_rbac to ensure the connection is tracked during it's entire valid span
-                connection_manager.register(&rbac_ctx).await;
-                if from_waypoint {
-                    debug!("request from waypoint, skipping policy");
-                } else if !pi.state.assert_rbac(&rbac_ctx).await {
-                    info!(%rbac_ctx.conn, "RBAC rejected");
-                    connection_manager.release(&rbac_ctx).await;
-                    return Ok(Response::builder()
-                        .status(StatusCode::UNAUTHORIZED)
-                        .body(Empty::new())
-                        .unwrap());
-                }
-                if has_waypoint && !from_waypoint {
-                    info!(%rbac_ctx.conn, "bypassed waypoint");
-                    connection_manager.release(&rbac_ctx).await;
-                    return Ok(Response::builder()
-                        .status(StatusCode::UNAUTHORIZED)
-                        .body(Empty::new())
-                        .unwrap());
-                }
-                let source_ip = if from_waypoint {
-                    // If the request is from our waypoint, trust the Forwarded header.
-                    // For other request types, we can only trust the source from the connection.
-                    // Since our own waypoint is in the same trust domain though, we can use Forwarded,
-                    // which drops the requirement of spoofing IPs from waypoints
-                    super::get_original_src_from_fwded(&req).unwrap_or(rbac_ctx.conn.src_ip)
-                } else {
-                    rbac_ctx.conn.src_ip
-                };
-
-                let baggage =
-                    parse_baggage_header(req.headers().get_all(BAGGAGE_HEADER)).unwrap_or_default();
-
-                let source = match from_gateway {
-                    true => None, // we cannot lookup source workload since we don't know the network, see https://github.com/istio/ztunnel/issues/515
-                    false => {
-                        let src_network_addr = NetworkAddress {
-                            // we can assume source network is our network because we did not traverse a gateway
-                            network: rbac_ctx.conn.dst_network.to_string(),
-                            address: source_ip,
-                        };
-                        // Find source info. We can lookup by XDS or from connection attributes
-                        pi.state.fetch_workload(&src_network_addr).await
-                    }
-                };
-
-                let derived_source = metrics::DerivedWorkload {
-                    identity: rbac_ctx.conn.src_identity.clone(),
-                    cluster_id: baggage.cluster_id,
-                    namespace: baggage.namespace,
-                    workload_name: baggage.workload_name,
-                    revision: baggage.revision,
-                    ..Default::default()
-                };
-                let ds = proxy::guess_inbound_service(&rbac_ctx.conn, upstream_service, &upstream);
-                let connection_metrics = ConnectionOpen {
-                    reporter: Reporter::destination,
-                    source,
-                    derived_source: Some(derived_source),
-                    destination: Some(upstream),
-                    connection_security_policy: metrics::SecurityPolicy::mutual_tls,
-                    destination_service: ds,
-                };
-                let status_code = match Self::handle_inbound(
-                    Hbone(req),
-                    enable_original_source.then_some(source_ip),
-                    addr,
-                    pi.metrics,
-                    connection_metrics,
-                    None,
-                    pi.socket_factory.as_ref(),
-                    connection_manager,
-                    rbac_ctx,
-                )
-                .in_current_span()
-                .await
-                {
-                    Ok(_) => StatusCode::OK,
-                    Err(_) => StatusCode::SERVICE_UNAVAILABLE,
-                };
-
-                Ok(Response::builder()
-                    .status(status_code)
-                    .body(Empty::new())
-                    .unwrap())
-            }
-            // Return the 404 Not Found for other routes.
-            method => {
-                info!("Sending 404, got {method}");
-                Ok(Response::builder()
-                    .status(StatusCode::NOT_FOUND)
-                    .body(Empty::new())
-                    .unwrap())
-            }
+        let method = req.method();
+        if method != Method::CONNECT {
+            info!("Sending 404, got {method}");
+            return Ok(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Empty::new())
+                .unwrap());
         }
+
+        let uri = req.uri();
+        info!("got {} request to {}", req.method(), uri);
+        let addr: Result<SocketAddr, _> = uri.to_string().as_str().parse();
+        if addr.is_err() {
+            info!("Sending 400, {:?}", addr.err());
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Empty::new())
+                .unwrap());
+        }
+
+        let addr: SocketAddr = addr.unwrap();
+        if addr.ip() != conn.dst.ip() {
+            info!("Sending 400, ip mismatch {addr} != {}", conn.dst);
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Empty::new())
+                .unwrap());
+        }
+        // Orig has 15008, swap with the real port
+        let conn = Connection { dst: addr, ..conn };
+        let dst_network_addr = NetworkAddress {
+            network: conn.dst_network.to_string(), // dst must be on our network
+            address: addr.ip(),
+        };
+        let Some((upstream, upstream_service)) =
+            pi.state.fetch_workload_services(&dst_network_addr).await
+        else {
+            info!(%conn, "unknown destination");
+            return Ok(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Empty::new())
+                .unwrap());
+        };
+        let has_waypoint = upstream.waypoint.is_some();
+        let from_waypoint = Self::check_waypoint(pi.state.clone(), &upstream, &conn).await;
+        let from_gateway = Self::check_gateway(pi.state.clone(), &upstream, &conn).await;
+
+        if from_gateway {
+            debug!("request from gateway");
+        }
+
+        let rbac_ctx = crate::state::ProxyRbacContext {
+            conn,
+            dest_workload_info: pi.proxy_workload_info.clone(),
+        };
+
+        //register before assert_rbac to ensure the connection is tracked during it's entire valid span
+        connection_manager.register(&rbac_ctx).await;
+        if from_waypoint {
+            debug!("request from waypoint, skipping policy");
+        } else if !pi.state.assert_rbac(&rbac_ctx).await {
+            info!(%rbac_ctx.conn, "RBAC rejected");
+            connection_manager.release(&rbac_ctx).await;
+            return Ok(Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .body(Empty::new())
+                .unwrap());
+        }
+        if has_waypoint && !from_waypoint {
+            info!(%rbac_ctx.conn, "bypassed waypoint");
+            connection_manager.release(&rbac_ctx).await;
+            return Ok(Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .body(Empty::new())
+                .unwrap());
+        }
+        let source_ip = if from_waypoint {
+            // If the request is from our waypoint, trust the Forwarded header.
+            // For other request types, we can only trust the source from the connection.
+            // Since our own waypoint is in the same trust domain though, we can use Forwarded,
+            // which drops the requirement of spoofing IPs from waypoints
+            super::get_original_src_from_fwded(&req).unwrap_or(rbac_ctx.conn.src_ip)
+        } else {
+            rbac_ctx.conn.src_ip
+        };
+
+        let baggage =
+            parse_baggage_header(req.headers().get_all(BAGGAGE_HEADER)).unwrap_or_default();
+
+        let source = match from_gateway {
+            true => None, // we cannot lookup source workload since we don't know the network, see https://github.com/istio/ztunnel/issues/515
+            false => {
+                let src_network_addr = NetworkAddress {
+                    // we can assume source network is our network because we did not traverse a gateway
+                    network: rbac_ctx.conn.dst_network.to_string(),
+                    address: source_ip,
+                };
+                // Find source info. We can lookup by XDS or from connection attributes
+                pi.state.fetch_workload(&src_network_addr).await
+            }
+        };
+
+        let derived_source = metrics::DerivedWorkload {
+            identity: rbac_ctx.conn.src_identity.clone(),
+            cluster_id: baggage.cluster_id,
+            namespace: baggage.namespace,
+            workload_name: baggage.workload_name,
+            revision: baggage.revision,
+            ..Default::default()
+        };
+        let ds = proxy::guess_inbound_service(&rbac_ctx.conn, upstream_service, &upstream);
+        let connection_metrics = ConnectionOpen {
+            reporter: Reporter::destination,
+            source,
+            derived_source: Some(derived_source),
+            destination: Some(upstream),
+            connection_security_policy: metrics::SecurityPolicy::mutual_tls,
+            destination_service: ds,
+        };
+        let status_code = match Self::handle_inbound(
+            Hbone(req),
+            enable_original_source.then_some(source_ip),
+            addr,
+            pi.metrics,
+            connection_metrics,
+            None,
+            pi.socket_factory.as_ref(),
+            connection_manager,
+            rbac_ctx,
+        )
+        .in_current_span()
+        .await
+        {
+            Ok(_) => StatusCode::OK,
+            Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+        };
+
+        Ok(Response::builder()
+            .status(status_code)
+            .body(Empty::new())
+            .unwrap())
     }
 
     async fn check_waypoint(
