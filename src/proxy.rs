@@ -262,6 +262,9 @@ pub enum Error {
 
     #[error("unsupported feature: {0}")]
     UnsupportedFeature(String),
+
+    #[error("ip mismatch: {0} != {1}")]
+    IPMismatch(IpAddr, IpAddr),
 }
 
 // TLS record size max is 16k. But we also have a H2 frame header, so leave a bit of room for that.

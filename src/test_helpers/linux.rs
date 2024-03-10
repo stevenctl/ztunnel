@@ -254,6 +254,7 @@ impl<'a> TestServiceBuilder<'a> {
 pub struct TestWorkloadBuilder<'a> {
     w: LocalWorkload,
     captured: bool,
+    inpod: bool,
     manager: &'a mut WorkloadManager,
 }
 
@@ -261,6 +262,7 @@ impl<'a> TestWorkloadBuilder<'a> {
     pub fn new(name: &str, manager: &'a mut WorkloadManager) -> TestWorkloadBuilder<'a> {
         TestWorkloadBuilder {
             captured: true, // workload has redirection enabled
+            inpod: false,
             w: LocalWorkload {
                 workload: Workload {
                     name: name.to_string(),
@@ -275,7 +277,13 @@ impl<'a> TestWorkloadBuilder<'a> {
         }
     }
 
-    /// Set the workload to use HBONE
+    // Set the workload to use in-pod redirection
+    pub fn inpod(mut self) -> Self {
+        self.inpod = true;
+        self
+    }
+
+    // Set the workload to use HBONE
     pub fn hbone(mut self) -> Self {
         self.w.workload.protocol = HBONE;
         self
@@ -375,6 +383,13 @@ impl<'a> TestWorkloadBuilder<'a> {
                 .or_default()
                 .push(network_namespace.ip());
         }
+        if self.inpod {
+            network_namespace.netns().run(|_| {
+                // add "CNI" rules
+                helpers::run_command("scripts/ztunnel-redirect-inpod.sh")
+            })??;
+        }
+
         Ok(network_namespace)
     }
 }

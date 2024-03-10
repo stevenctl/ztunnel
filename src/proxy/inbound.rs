@@ -40,6 +40,8 @@ use crate::proxy::metrics::{ConnectionOpen, Metrics, Reporter};
 use crate::proxy::{metrics, ProxyInputs, TraceParent, BAGGAGE_HEADER, TRACEPARENT_HEADER};
 use crate::rbac::Connection;
 use crate::socket::to_canonical;
+use crate::state::service::Service;
+use crate::state::workload::address::Address;
 use crate::{proxy, tls};
 
 use crate::state::workload::{address, GatewayAddress, NetworkAddress, Workload};
@@ -284,41 +286,39 @@ impl Inbound {
 
         let uri = req.uri();
         info!("got {} request to {}", req.method(), uri);
-        let addr: Result<SocketAddr, _> = uri.to_string().as_str().parse();
-        if addr.is_err() {
-            info!("Sending 400, {:?}", addr.err());
-            return Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Empty::new())
-                .unwrap());
-        }
+        let hbone_addr: SocketAddr = match uri.to_string().as_str().parse() {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                info!("Sending 400, {}", e);
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(Empty::new())
+                    .unwrap());
+            }
+        };
 
-        let addr: SocketAddr = addr.unwrap();
-        if addr.ip() != conn.dst.ip() {
-            info!("Sending 400, ip mismatch {addr} != {}", conn.dst);
-            return Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Empty::new())
-                .unwrap());
-        }
+        let (upstream_addr, upstream, upstream_service) =
+            match Self::find_inbound_upstream(pi.state.clone(), &conn, hbone_addr).await {
+                Ok(res) => res,
+                Err(e) => {
+                    info!(%conn, "Sending 400, {}", e);
+                    return Ok(Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Empty::new())
+                        .unwrap());
+                }
+            };
+
         // Orig has 15008, swap with the real port
-        let conn = Connection { dst: addr, ..conn };
-        let dst_network_addr = NetworkAddress {
-            network: conn.dst_network.to_string(), // dst must be on our network
-            address: addr.ip(),
+        let conn = Connection {
+            dst: upstream_addr,
+            ..conn
         };
-        let Some((upstream, upstream_service)) =
-            pi.state.fetch_workload_services(&dst_network_addr).await
-        else {
-            info!(%conn, "unknown destination");
-            return Ok(Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(Empty::new())
-                .unwrap());
-        };
+
         let has_waypoint = upstream.waypoint.is_some();
-        let from_waypoint = Self::check_waypoint(pi.state.clone(), &upstream, &conn).await;
-        let from_gateway = Self::check_gateway(pi.state.clone(), &upstream, &conn).await;
+        let from_waypoint = Self::check_from_waypoint(pi.state.clone(), &upstream, &conn).await;
+        let from_gateway =
+            Self::check_from_network_gateway(pi.state.clone(), &upstream, &conn).await;
 
         if from_gateway {
             debug!("request from gateway");
@@ -341,6 +341,7 @@ impl Inbound {
                 .body(Empty::new())
                 .unwrap());
         }
+
         if has_waypoint && !from_waypoint {
             info!(%rbac_ctx.conn, "bypassed waypoint");
             connection_manager.release(&rbac_ctx).await;
@@ -395,7 +396,7 @@ impl Inbound {
         let status_code = match Self::handle_inbound(
             Hbone(req),
             enable_original_source.then_some(source_ip),
-            addr,
+            upstream_addr,
             pi.metrics,
             connection_metrics,
             None,
@@ -416,7 +417,8 @@ impl Inbound {
             .unwrap())
     }
 
-    async fn check_waypoint(
+    // Checks if the connection's source identity is the identity for the upstream's waypoint
+    async fn check_from_waypoint(
         state: DemandProxyState,
         upstream: &Workload,
         conn: &Connection,
@@ -424,7 +426,9 @@ impl Inbound {
         Self::check_gateway_address(state, conn, upstream.waypoint.as_ref()).await
     }
 
-    async fn check_gateway(
+    // Checks if the connection's source identity is the identity for the upstream's network
+    // gateway
+    async fn check_from_network_gateway(
         state: DemandProxyState,
         upstream: &Workload,
         conn: &Connection,
@@ -432,6 +436,7 @@ impl Inbound {
         Self::check_gateway_address(state, conn, upstream.network_gateway.as_ref()).await
     }
 
+    // Check if the source's identity matches any workloads that make up the given gateway
     async fn check_gateway_address(
         state: DemandProxyState,
         conn: &Connection,
@@ -459,6 +464,106 @@ impl Inbound {
             return from_gateway;
         }
         false // this occurs if gateway_address was None
+    }
+
+    async fn find_inbound_upstream(
+        state: DemandProxyState,
+        conn: &Connection,
+        hbone_addr: SocketAddr,
+    ) -> Result<(SocketAddr, Workload, Vec<Service>), Error> {
+        let dst = &NetworkAddress {
+            network: conn.dst_network.to_string(),
+            address: hbone_addr.ip(),
+        };
+
+        // If the IPs match, this is not sandwich.
+        if conn.dst.ip() == hbone_addr.ip() {
+            let Some((us_wl, us_svc)) = state.fetch_workload_services(dst).await else {
+                return Err(Error::UnknownDestination(hbone_addr.ip()));
+            };
+            return Ok((hbone_addr, us_wl, us_svc));
+        }
+
+        if let Some((us_wl, us_svc)) = Self::find_sandwich_upstream(state, conn, hbone_addr).await {
+            let next_hop = SocketAddr::new(conn.dst.ip(), hbone_addr.port());
+            return Ok((next_hop, us_wl, us_svc));
+        }
+
+        Err(Error::IPMismatch(conn.dst.ip(), hbone_addr.ip()))
+    }
+
+    async fn find_sandwich_upstream(
+        state: DemandProxyState,
+        conn: &Connection,
+        hbone_addr: SocketAddr,
+    ) -> Option<(Workload, Vec<Service>)> {
+        let connection_dst = &NetworkAddress {
+            network: conn.dst_network.to_string(),
+            address: conn.dst.ip(),
+        };
+        let hbone_dst = &NetworkAddress {
+            network: conn.dst_network.to_string(),
+            address: hbone_addr.ip(),
+        };
+
+        // Outer option tells us whether or not we can retry
+        // Some(None) means we have enough information to decide this isn't sandwich
+        let lookup = || -> Option<Option<(Workload, Vec<Service>)>> {
+            let state = state.read();
+
+            // TODO Allow HBONE address to be a hostname. We have to respect rules about
+            // hostname scoping. Can we use the client's namespace here to do that?
+            let hbone_target = state.find_address(hbone_dst);
+
+            // We can only sandwich a Workload waypoint
+            let conn_wl = state.workloads.find_address(connection_dst);
+
+            // on-demand fetch then retry
+            let (Some(hbone_target), Some(conn_wl)) = (hbone_target, conn_wl) else {
+                return None;
+            };
+
+
+            let Some(target_waypoint) = (match hbone_target {
+                Address::Service(svc) => svc.waypoint.clone(),
+                Address::Workload(wl) => wl.waypoint,
+            }) else {
+                // can't sandwich if the HBONE target doesn't want a Waypoint.
+                return Some(None);
+            };
+
+            // Resolve the reference from our HBONE target
+            let target_waypoint = state.find_destination(&target_waypoint.destination);
+
+            let Some(target_waypoint) = target_waypoint else {
+                // don't need to fetch/retry this; we found conn_wl and this must match conn_wl.
+                return Some(None);
+            };
+
+            // Validate that the HBONE target references the Waypoint we're connecting to
+            Some(match target_waypoint {
+                Address::Service(svc) => {
+                    if !svc.contains_endpoint(&conn_wl, Some(connection_dst)) {
+                        return Some(None);
+                    }
+                    Some((conn_wl, vec![*svc]))
+                }
+                Address::Workload(wl) => {
+                    let svc = state.services.get_by_workload(&wl);
+                    Some((*wl, svc))
+                }
+            })
+        };
+
+        if let Some(res) = lookup() {
+            return res;
+        }
+
+        tokio::join![
+            state.fetch_on_demand(connection_dst.to_string()),
+            state.fetch_on_demand(hbone_dst.to_string()),
+        ];
+        lookup().flatten()
     }
 }
 
@@ -570,18 +675,38 @@ mod test {
         };
 
         let upstream_with_address = mock_wokload_with_gateway(Some(mock_default_gateway_address()));
-        assert!(Inbound::check_gateway(state.clone(), &upstream_with_address, &from_gw_conn).await);
         assert!(
-            !Inbound::check_gateway(state.clone(), &upstream_with_address, &not_from_gw_conn).await
+            Inbound::check_from_network_gateway(
+                state.clone(),
+                &upstream_with_address,
+                &from_gw_conn
+            )
+            .await
+        );
+        assert!(
+            !Inbound::check_from_network_gateway(
+                state.clone(),
+                &upstream_with_address,
+                &not_from_gw_conn
+            )
+            .await
         );
 
         // using hostname (will check the service variant of address::Address)
         let upstream_with_hostname =
             mock_wokload_with_gateway(Some(mock_default_gateway_hostname()));
         assert!(
-            Inbound::check_gateway(state.clone(), &upstream_with_hostname, &from_gw_conn).await
+            Inbound::check_from_network_gateway(
+                state.clone(),
+                &upstream_with_hostname,
+                &from_gw_conn
+            )
+            .await
         );
-        assert!(!Inbound::check_gateway(state, &upstream_with_hostname, &not_from_gw_conn).await);
+        assert!(
+            !Inbound::check_from_network_gateway(state, &upstream_with_hostname, &not_from_gw_conn)
+                .await
+        );
     }
 
     // private helpers

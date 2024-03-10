@@ -20,12 +20,34 @@ use std::path::Path;
 use tokio::io::AsyncReadExt;
 use tracing::info;
 
+pub struct ZTunnelServer {
+    register_workload: tokio::sync::mpsc::Sender<i32>,
+    register_workload_ack: tokio::sync::mpsc::Receiver<()>,
+}
+
+impl ZTunnelServer {
+    pub fn new(
+        tx: tokio::sync::mpsc::Sender<i32>,
+        ack_rx: tokio::sync::mpsc::Receiver<()>,
+    ) -> ZTunnelServer {
+        ZTunnelServer {
+            register_workload: tx,
+            register_workload_ack: ack_rx,
+        }
+    }
+    pub async fn register_workload(&mut self, fd: i32) {
+        self.register_workload.send(fd).await.unwrap();
+        self.register_workload_ack.recv().await.unwrap();
+    }
+
+    pub async fn node_removed(&mut self) {
+        self.register_workload(-1).await;
+    }
+}
+
 pub fn start_ztunnel_server<P: AsRef<Path> + Send + 'static>(
     bind_path: P,
-) -> (
-    tokio::sync::mpsc::Sender<i32>,
-    tokio::sync::mpsc::Receiver<()>,
-) {
+) -> ZTunnelServer {
     info!("starting server {}", bind_path.as_ref().display());
 
     // remove file if exists
@@ -91,5 +113,5 @@ pub fn start_ztunnel_server<P: AsRef<Path> + Send + 'static>(
             }
         });
     });
-    (tx, ack_rx)
+    ZTunnelServer::new(tx, ack_rx)
 }

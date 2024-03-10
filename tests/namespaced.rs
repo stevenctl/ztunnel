@@ -249,10 +249,8 @@ mod namespaced {
         let randnum: usize = rand::random();
         let uds_remote_node = PathBuf::from(format!("/tmp/ztunnel-uds-remote-{}", randnum));
         let uds_default_node = PathBuf::from(format!("/tmp/ztunnel-uds-default-{}", randnum));
-        let (remote_node_server, mut remote_node_server_ack) =
-            start_ztunnel_server(uds_remote_node.clone());
-        let (default_node_server, mut default_node_server_ack) =
-            start_ztunnel_server(uds_default_node.clone());
+        let mut remote_node_server = start_ztunnel_server(uds_remote_node.clone());
+        let mut default_node_server = start_ztunnel_server(uds_default_node.clone());
 
         info!("starting in-pod test");
         let server = manager
@@ -284,10 +282,8 @@ mod namespaced {
         let local = manager.deploy_ztunnel_inpod(DEFAULT_NODE, uds_default_node.clone())?;
 
         info!("sending workload to ztunnel");
-        remote_node_server.send(server_fd).await.unwrap();
-        remote_node_server_ack.recv().await.unwrap();
-        default_node_server.send(client_fd).await.unwrap();
-        default_node_server_ack.recv().await.unwrap();
+        remote_node_server.register_workload(server_fd).await;
+        default_node_server.register_workload(client_fd).await;
 
         info!("running tcp client");
         run_tcp_client(client, manager.resolver(), "server")?;
@@ -306,10 +302,8 @@ mod namespaced {
         assert_eq!(local.inpod_state().await?.len(), 1);
 
         // now tell ztunnel the node was removed
-        remote_node_server.send(-1).await.unwrap();
-        remote_node_server_ack.recv().await.unwrap();
-        default_node_server.send(-1).await.unwrap();
-        default_node_server_ack.recv().await.unwrap();
+        remote_node_server.node_removed().await;
+        default_node_server.node_removed().await;
         let remote_state = remote.inpod_state().await?;
 
         info!("verifying remote state {:?}", remote_state);
