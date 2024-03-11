@@ -470,15 +470,26 @@ impl OutboundConnection {
             )
             .await?;
 
+        // TODO src_id may not be enough; should also check addresses/uid
+        let src_id = Some(source_workload.identity());
+        let from_waypoint = proxy::check_from_waypoint(
+            self.pi.state.clone(),
+            &mutable_us.workload,
+            src_id.as_ref(),
+        )
+        .await;
+
         // For case upstream server has enabled waypoint
-        match self
-            .pi
-            .state
-            .fetch_waypoint(&mutable_us.workload, workload_ip)
-            .await
-        {
-            Ok(None) => {} // workload doesn't have a waypoint; this is fine
-            Ok(Some(waypoint_us)) => {
+        match (
+            from_waypoint,
+            self.pi
+                .state
+                .fetch_waypoint(&mutable_us.workload, workload_ip)
+                .await,
+        ) {
+            (_, Ok(None)) => {} // workload doesn't have a waypoint; this is fine
+            (true, _) => {}     // we already traversed the waypoint
+            (false, Ok(Some(waypoint_us))) => {
                 let waypoint_workload = waypoint_us.workload;
                 let waypoint_ip = self
                     .pi
@@ -507,7 +518,7 @@ impl OutboundConnection {
                 });
             }
             // we expected the workload to have a waypoint, but could not find one
-            Err(e) => return Err(Error::UnknownWaypoint(e.to_string())),
+            (_, Err(e)) => return Err(Error::UnknownWaypoint(e.to_string())),
         }
 
         let us = match set_gateway_address(&mut mutable_us, workload_ip, self.pi.hbone_port) {
@@ -666,6 +677,7 @@ mod tests {
             namespace: "ns".to_string(),
             addresses: vec![Bytes::copy_from_slice(&[127, 0, 0, 10])],
             node: "local-node".to_string(),
+            service_account: "waypoint-sa".to_string(), 
             ..Default::default()
         };
         let state = match xds {
