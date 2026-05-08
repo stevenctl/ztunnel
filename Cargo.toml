@@ -69,6 +69,7 @@ hyper-rustls = { version = "0.27.9", default-features = false, features = ["logg
 hyper-util = { version = "0.1", features = ["full"] }
 ipnet = { version = "2.12", features = ["serde"] }
 itertools = "0.14"
+prefix-trie = "0.8"
 keyed_priority_queue = "0.4"
 libc = "0.2"
 log = "0.4"

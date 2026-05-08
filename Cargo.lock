@@ -4917,6 +4917,7 @@ dependencies = [
  "pingora-pool",
  "ppp",
  "pprof",
+ "prefix-trie",
  "prometheus-client",
  "prometheus-parse",
  "prost 0.14.3",

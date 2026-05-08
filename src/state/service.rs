@@ -13,8 +13,9 @@
 // limitations under the License.
 
 use bytes::Bytes;
-use ipnet::IpNet;
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use itertools::Itertools;
+use prefix_trie::map::PrefixMap;
 use serde::{Deserializer, Serializer};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -360,9 +361,10 @@ pub struct ServiceStore {
     /// Multiple services in different namespaces may share the same VIP.
     pub(super) by_vip: HashMap<NetworkAddress, Vec<Arc<Service>>>,
 
-    /// Allows for lookup of services by CIDR VIP. Checked as a fallback when exact VIP
-    /// lookup misses, using longest-prefix-match semantics.
-    pub(super) by_cidr_vip: Vec<(NetworkCidr, Arc<Service>)>,
+    /// Allows for lookup of services by CIDR VIP, keyed by network. Checked as
+    /// a fallback when exact VIP lookup misses, using longest-prefix-match
+    /// semantics. See [`CidrTrie`].
+    pub(super) by_cidr_vip: HashMap<Strng, CidrTrie>,
 
     /// Allows for lookup of services by hostname, and then by namespace. XDS uses a combination
     /// of hostname and namespace as the primary key. In most cases, there will be a single
@@ -402,21 +404,9 @@ impl ServiceStore {
         vip: &NetworkAddress,
         ns: Option<&Strng>,
     ) -> Option<Arc<Service>> {
-        let mut best: Option<RankedMatch<'_>> = None;
-        for (nc, svc) in &self.by_cidr_vip {
-            if nc.network != vip.network || !nc.cidr.contains(&vip.address) {
-                continue;
-            }
-            let rank = CidrMatchRank {
-                in_namespace: ns.is_some_and(|n| &svc.namespace == n),
-                prefix_len: nc.cidr.prefix_len(),
-                canonical: svc.canonical,
-            };
-            if best.as_ref().is_none_or(|b| rank > b.rank) {
-                best = Some(RankedMatch { rank, svc });
-            }
-        }
-        best.map(|m| m.svc.clone())
+        self.by_cidr_vip
+            .get(&vip.network)?
+            .get_best(vip.address, ns)
     }
 
     /// Returns the list of [Service]s matching the given hostname. Istio `ServiceEntry`
@@ -585,7 +575,10 @@ impl ServiceStore {
             }
         }
         for cidr in &service.cidr_vips {
-            self.by_cidr_vip.push((cidr.clone(), service.clone()));
+            self.by_cidr_vip
+                .entry(cidr.network.clone())
+                .or_default()
+                .insert(&cidr.cidr, service.clone());
         }
 
         // Map the hostname to the service.
@@ -644,8 +637,14 @@ impl ServiceStore {
                     }
                 });
                 let prev_host = prev.namespaced_hostname();
-                self.by_cidr_vip
-                    .retain(|(_, svc)| svc.namespaced_hostname() != prev_host);
+                for cidr in &prev.cidr_vips {
+                    if let Some(trie) = self.by_cidr_vip.get_mut(&cidr.network) {
+                        trie.remove(&cidr.cidr, &prev_host);
+                        if trie.is_empty() {
+                            self.by_cidr_vip.remove(&cidr.network);
+                        }
+                    }
+                }
 
                 // Remove the staged service.
                 // TODO(nmittler): no endpoints for this service should be staged at this point.
@@ -675,6 +674,16 @@ impl ServiceStore {
     pub fn num_staged_services(&self) -> usize {
         self.staged_services.len()
     }
+
+    #[cfg(test)]
+    pub fn num_cidr_vips(&self) -> usize {
+        self.by_cidr_vip.values().map(CidrTrie::entry_count).sum()
+    }
+
+    #[cfg(test)]
+    pub fn cidr_vips_is_empty(&self) -> bool {
+        self.by_cidr_vip.values().all(CidrTrie::is_empty)
+    }
 }
 
 /// Ranking for a CIDR-VIP match. Ordered lexicographically over
@@ -691,6 +700,102 @@ struct CidrMatchRank {
 struct RankedMatch<'a> {
     rank: CidrMatchRank,
     svc: &'a Arc<Service>,
+}
+
+/// Per-network CIDR trie for longest-prefix-match lookup.
+///
+/// `Vec<Arc<Service>>` per prefix because multiple services can share an
+/// identical CIDR (different namespaces, ServiceEntry semantics) — the rank
+/// scan in [`CidrTrie::get_best`] still has to disambiguate them by namespace
+/// and `canonical`. The trie collapses the *cross-prefix* search from O(n) to
+/// O(prefix_len).
+#[derive(Default, Debug)]
+pub(super) struct CidrTrie {
+    v4: PrefixMap<Ipv4Net, Vec<Arc<Service>>>,
+    v6: PrefixMap<Ipv6Net, Vec<Arc<Service>>>,
+}
+
+impl CidrTrie {
+    fn insert(&mut self, cidr: &IpNet, service: Arc<Service>) {
+        match cidr {
+            IpNet::V4(net) => self.v4.entry(*net).or_default().push(service),
+            IpNet::V6(net) => self.v6.entry(*net).or_default().push(service),
+        };
+    }
+
+    /// Drops any service whose `namespaced_hostname()` matches `prev_host` from
+    /// the entry at `cidr`, removing the entry entirely if it becomes empty.
+    fn remove(&mut self, cidr: &IpNet, prev_host: &NamespacedHostname) {
+        match cidr {
+            IpNet::V4(net) => {
+                if let Some(svcs) = self.v4.get_mut(net) {
+                    svcs.retain(|s| s.namespaced_hostname() != *prev_host);
+                    if svcs.is_empty() {
+                        self.v4.remove(net);
+                    }
+                }
+            }
+            IpNet::V6(net) => {
+                if let Some(svcs) = self.v6.get_mut(net) {
+                    svcs.retain(|s| s.namespaced_hostname() != *prev_host);
+                    if svcs.is_empty() {
+                        self.v6.remove(net);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Walks all CIDRs covering `addr` and returns the best by
+    /// `(in_namespace, prefix_len, canonical)`. `cover` yields prefixes by
+    /// ascending depth, so this is O(matching_prefixes) — bounded by the
+    /// host bit-length (32 for v4, 128 for v6) regardless of total trie size.
+    fn get_best(&self, addr: IpAddr, ns: Option<&Strng>) -> Option<Arc<Service>> {
+        let mut best: Option<RankedMatch<'_>> = None;
+        match addr {
+            IpAddr::V4(a) => {
+                let probe = Ipv4Net::new(a, 32).expect("32 is a valid v4 prefix length");
+                for (cidr, services) in self.v4.cover(&probe) {
+                    rank_into(&mut best, cidr.prefix_len(), services, ns);
+                }
+            }
+            IpAddr::V6(a) => {
+                let probe = Ipv6Net::new(a, 128).expect("128 is a valid v6 prefix length");
+                for (cidr, services) in self.v6.cover(&probe) {
+                    rank_into(&mut best, cidr.prefix_len(), services, ns);
+                }
+            }
+        }
+        best.map(|m| m.svc.clone())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.v4.is_empty() && self.v6.is_empty()
+    }
+
+    #[cfg(test)]
+    fn entry_count(&self) -> usize {
+        self.v4.iter().map(|(_, v)| v.len()).sum::<usize>()
+            + self.v6.iter().map(|(_, v)| v.len()).sum::<usize>()
+    }
+}
+
+fn rank_into<'a>(
+    best: &mut Option<RankedMatch<'a>>,
+    prefix_len: u8,
+    services: &'a [Arc<Service>],
+    ns: Option<&Strng>,
+) {
+    for svc in services {
+        let rank = CidrMatchRank {
+            in_namespace: ns.is_some_and(|n| &svc.namespace == n),
+            prefix_len,
+            canonical: svc.canonical,
+        };
+        if best.as_ref().is_none_or(|b| rank > b.rank) {
+            *best = Some(RankedMatch { rank, svc });
+        }
+    }
 }
 
 /// Represents the reason a service was matched during lookup.
@@ -1149,7 +1254,7 @@ mod tests {
         });
 
         assert!(store.get_best_by_vip(&nw(ip(10, 0, 0, 5)), None).is_none());
-        assert!(store.by_cidr_vip.is_empty());
+        assert!(store.cidr_vips_is_empty());
     }
 
     #[test]
@@ -1168,7 +1273,7 @@ mod tests {
             vec![cidr("10.0.0.0/24")],
         ));
 
-        assert_eq!(store.by_cidr_vip.len(), 2);
+        assert_eq!(store.num_cidr_vips(), 2);
 
         let ns_a: Strng = "ns-a".into();
         let ns_b: Strng = "ns-b".into();
@@ -1192,7 +1297,7 @@ mod tests {
             namespace: "ns-a".into(),
             hostname: "svc.ns-a.svc.cluster.local".into(),
         });
-        assert_eq!(store.by_cidr_vip.len(), 1);
+        assert_eq!(store.num_cidr_vips(), 1);
         let svc = store.get_best_by_vip(&nw(ip(10, 0, 0, 5)), None).unwrap();
         assert_eq!(svc.namespace, "ns-b");
 
@@ -1200,7 +1305,7 @@ mod tests {
             namespace: "ns-b".into(),
             hostname: "svc.ns-b.svc.cluster.local".into(),
         });
-        assert!(store.by_cidr_vip.is_empty());
+        assert!(store.cidr_vips_is_empty());
         assert!(store.get_best_by_vip(&nw(ip(10, 0, 0, 5)), None).is_none());
     }
 
