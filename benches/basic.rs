@@ -30,6 +30,7 @@ use ztunnel::xds::istio::workload::LoadBalancing;
 use ztunnel::xds::istio::workload::Port;
 use ztunnel::xds::istio::workload::Service as XdsService;
 use ztunnel::xds::istio::workload::Workload as XdsWorkload;
+use ztunnel::xds::istio::workload::Locality as XdsLocality;
 use ztunnel::xds::istio::workload::load_balancing;
 use ztunnel::xds::istio::workload::{NetworkAddress as XdsNetworkAddress, PortList};
 
@@ -92,7 +93,7 @@ pub fn load_balance(c: &mut Criterion) {
     let mut c = c.benchmark_group("load_balance");
     c.throughput(Throughput::Elements(1));
     c.measurement_time(Duration::from_secs(5));
-    let mut run = move |name, wl_count, lb: Option<LoadBalancing>| {
+    let mut run = |name, wl_count, lb: Option<LoadBalancing>| {
         let (rt, demand, src_wl, svc_addr) = build_load_balancer(wl_count, lb.clone());
         c.bench_function(name, move |b| {
             b.to_async(&rt).iter(|| async {
@@ -124,6 +125,31 @@ pub fn load_balance(c: &mut Criterion) {
     run("locality-10", 10, locality.clone());
     run("locality-1000", 1000, locality.clone());
     run("locality-10000", 10000, locality.clone());
+
+    // `spread-N` parallels `locality-N` but distributes endpoints across rank
+    // tiers (only ~10% match the source's full locality). This exercises the
+    // ranking code on a realistic mix where most candidates are not at the
+    // best rank — unlike `locality-N`, where every endpoint matches all prefs.
+    let mut run_spread = |name, wl_count| {
+        let (rt, demand, src_wl, svc_addr) =
+            build_spread_load_balancer(wl_count, locality.clone());
+        c.bench_function(name, move |b| {
+            b.to_async(&rt).iter(|| async {
+                demand
+                    .fetch_upstream(
+                        "".into(),
+                        &src_wl,
+                        svc_addr,
+                        ServiceResolutionMode::Standard,
+                    )
+                    .await
+                    .unwrap()
+            })
+        });
+    };
+    run_spread("spread-10", 10);
+    run_spread("spread-1000", 1000);
+    run_spread("spread-10000", 10000);
 }
 
 fn build_load_balancer(
@@ -168,6 +194,103 @@ fn build_load_balancer(
                             }],
                         },
                     )]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    let mut registry = Registry::default();
+    let metrics = Arc::new(ztunnel::proxy::Metrics::new(&mut registry));
+    let demand = DemandProxyState::new(
+        Arc::new(RwLock::new(state)),
+        None,
+        ResolverConfig::default(),
+        ResolverOpts::default(),
+        metrics,
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let src_wl = rt
+        .block_on(demand.fetch_workload_by_uid(&"cluster1//v1/Pod/default/0".into()))
+        .unwrap();
+    let svc_addr: SocketAddr = "127.0.0.3:80".parse().unwrap();
+    (rt, demand, src_wl, svc_addr)
+}
+
+/// Build a load balancer where endpoints are spread across rank tiers, given
+/// routing preferences `[Network, Region, Zone, Subzone]`:
+///   ~10% rank 4 (full match — same subzone as source),
+///   ~20% rank 3 (same zone, different subzone),
+///   ~30% rank 2 (same region, different zone),
+///   ~40% rank 1 (different region; only network matches).
+/// Source workload (uid 0) is in the rank-4 tier.
+fn build_spread_load_balancer(
+    wl_count: usize,
+    load_balancing: Option<LoadBalancing>,
+) -> (Runtime, DemandProxyState, Arc<Workload>, SocketAddr) {
+    let svc = XdsService {
+        hostname: "example.com".to_string(),
+        addresses: vec![XdsNetworkAddress {
+            network: "".to_string(),
+            address: vec![127, 0, 0, 3],
+            length: None,
+        }],
+        ports: vec![Port {
+            service_port: 80,
+            target_port: 0,
+        }],
+        load_balancing,
+        ..Default::default()
+    };
+    let mut state = ProxyState::new(None);
+    let updater = ProxyStateUpdateMutator::new_no_fetch();
+    updater.insert_service(&mut state, svc).unwrap();
+    let tier_locality = |i: usize| match i % 10 {
+        0 => XdsLocality {
+            region: "r0".to_string(),
+            zone: "z0".to_string(),
+            subzone: "sz0".to_string(),
+        },
+        1 | 2 => XdsLocality {
+            region: "r0".to_string(),
+            zone: "z0".to_string(),
+            subzone: "sz1".to_string(),
+        },
+        3 | 4 | 5 => XdsLocality {
+            region: "r0".to_string(),
+            zone: "z1".to_string(),
+            subzone: "sz0".to_string(),
+        },
+        _ => XdsLocality {
+            region: "r1".to_string(),
+            zone: "z0".to_string(),
+            subzone: "sz0".to_string(),
+        },
+    };
+    for i in 0..wl_count {
+        updater
+            .insert_workload(
+                &mut state,
+                XdsWorkload {
+                    uid: format!("cluster1//v1/Pod/default/{i}"),
+                    addresses: vec![Bytes::copy_from_slice(&[
+                        127,
+                        0,
+                        (i / 255) as u8,
+                        (i % 255) as u8,
+                    ])],
+                    services: std::collections::HashMap::from([(
+                        "/example.com".to_string(),
+                        PortList {
+                            ports: vec![Port {
+                                service_port: 80,
+                                target_port: 1234,
+                            }],
+                        },
+                    )]),
+                    locality: Some(tier_locality(i)),
                     ..Default::default()
                 },
             )
