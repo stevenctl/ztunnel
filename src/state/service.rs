@@ -705,10 +705,9 @@ struct RankedMatch<'a> {
 /// Per-network CIDR trie for longest-prefix-match lookup.
 ///
 /// `Vec<Arc<Service>>` per prefix because multiple services can share an
-/// identical CIDR (different namespaces, ServiceEntry semantics) — the rank
-/// scan in [`CidrTrie::get_best`] still has to disambiguate them by namespace
-/// and `canonical`. The trie collapses the *cross-prefix* search from O(n) to
-/// O(prefix_len).
+/// identical CIDR (different namespaces, ServiceEntry semantics), so the
+/// rank scan in [`CidrTrie::get_best`] still has to disambiguate by
+/// namespace and `canonical`.
 #[derive(Default, Debug)]
 pub(super) struct CidrTrie {
     v4: PrefixMap<Ipv4Net, Vec<Arc<Service>>>,
@@ -723,8 +722,6 @@ impl CidrTrie {
         };
     }
 
-    /// Drops any service whose `namespaced_hostname()` matches `prev_host` from
-    /// the entry at `cidr`, removing the entry entirely if it becomes empty.
     fn remove(&mut self, cidr: &IpNet, prev_host: &NamespacedHostname) {
         match cidr {
             IpNet::V4(net) => {
@@ -746,10 +743,6 @@ impl CidrTrie {
         }
     }
 
-    /// Walks all CIDRs covering `addr` and returns the best by
-    /// `(in_namespace, prefix_len, canonical)`. `cover` yields prefixes by
-    /// ascending depth, so this is O(matching_prefixes) — bounded by the
-    /// host bit-length (32 for v4, 128 for v6) regardless of total trie size.
     fn get_best(&self, addr: IpAddr, ns: Option<&Strng>) -> Option<Arc<Service>> {
         let mut best: Option<RankedMatch<'_>> = None;
         match addr {
